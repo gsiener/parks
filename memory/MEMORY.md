@@ -1,0 +1,3 @@
+- [User Profile](user_profile.md) — HS ultimate frisbee coach in NYC, needs parks dept field space
+- [Excluded Fields](feedback_excluded_fields.md) — Fields excluded from results (unplayable/construction): Parade Ground Soccer-04/04A/04B, Red Hook Soccer-01/06
+- [Table Sorting](feedback_table_sorting.md) — Sort tables by park name then field trailing number (numeric, not lexicographic)
