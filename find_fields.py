@@ -14,9 +14,7 @@ import urllib.request
 import json
 import gzip
 import math
-import sys
 from datetime import datetime, timedelta
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 UA = (
@@ -26,6 +24,10 @@ UA = (
 
 # Commute origin: Brooklyn Tech High School, Fort Greene
 ORIGIN = (40.6916, -73.9762)
+
+EARTH_RADIUS_MI = 3958.8
+TRANSIT_OVERHEAD_MIN = 10   # fixed walk-to/from-station overhead
+TRANSIT_MIN_PER_MILE = 6    # ~10 mph door-to-door in Brooklyn
 
 # Practice schedule: (weekday number per Python's isoweekday(), start_hour, start_min, end_hour, end_min)
 # Monday=1, Tuesday=2, ... Sunday=7
@@ -105,8 +107,8 @@ def transit_minutes_estimate(origin, dest):
     lat2, lon2 = math.radians(dest[0]), math.radians(dest[1])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    miles = 3958.8 * 2 * math.asin(math.sqrt(a))
-    return round(miles * 6 + 10)  # 6 min/mile in-vehicle + 10 min fixed overhead
+    miles = EARTH_RADIUS_MI * 2 * math.asin(math.sqrt(a))
+    return round(miles * TRANSIT_MIN_PER_MILE + TRANSIT_OVERHEAD_MIN)
 
 
 def latlng_to_tile(lat, lng, zoom):
@@ -305,7 +307,6 @@ def print_table(slots, field_statuses, fields, park_names):
         return ref
 
     def cell_raw(status, detail):
-        """Return cell text without centering."""
         if status == "free":
             return "Y"
         elif status == "pending_unnamed":
@@ -313,24 +314,24 @@ def print_table(slots, field_statuses, fields, park_names):
         elif status == "pending_named":
             refs = ",".join(sorted(org_ref(o) for o in detail))
             return f"P[{refs}]"
-        else:  # reserved
-            return "-"
+        return "-"
+
+    # Pre-assign footnote refs so they're stable during the single render pass
+    for _, _, _, _, statuses in rows:
+        for status, detail in statuses:
+            if status == "pending_named":
+                for org in detail:
+                    org_ref(org)
 
     park_w = max(len("Park"), max(len(r[0]) for r in rows))
     field_w = max(len("Field"), max(len(r[1]) for r in rows))
     surf_w = max(len("Surface"), max(len(r[2]) for r in rows))
     comm_w = max(len("Transit"), max(len(r[3]) for r in rows))
-
-    # Pre-compute raw cells to determine slot column width
-    raw_rendered = []
-    for park, field, surf, comm, statuses in rows:
-        raw_rendered.append([cell_raw(s, d) for s, d in statuses])
     slot_w = max(
         max(len(h) for h in headers),
-        max(len(c) for row in raw_rendered for c in row) if raw_rendered else 0,
+        max(len(cell_raw(s, d)) for _, _, _, _, statuses in rows for s, d in statuses),
     )
-    # Re-render with correct slot_w (footnote refs are stable across two passes)
-    footnotes.clear()
+
     rendered = []
     for park, field, surf, comm, statuses in rows:
         rendered.append([cell_raw(s, d) for s, d in statuses])
@@ -417,25 +418,19 @@ def main():
         return
 
     if args.table:
-        # Check global availability per slot
-        slot_reserved = []
-        for slot_start, slot_end in practice_dates:
-            date_str = slot_start.strftime("%a %b %d")
-            time_str = f"{slot_start.strftime('%-I:%M')}-{slot_end.strftime('%-I:%M %p')}"
-            print(f"Checking {date_str} {time_str}...")
-            slot_reserved.append(check_slot_availability(slot_start, slot_end))
-
-        # Fetch per-field schedules in parallel to detect pending requests
-        print("Fetching per-field schedules for pending status...")
         anchor_date = practice_dates[0][0].strftime("%Y-%m-%d")
-        schedules = {}
+        print("Checking availability and fetching field schedules...")
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_sid = {
+            slot_futures = [
+                executor.submit(check_slot_availability, s, e)
+                for s, e in practice_dates
+            ]
+            schedule_futures = {
                 executor.submit(fetch_field_schedule, sid, anchor_date): sid
                 for sid in fields
             }
-            for future in as_completed(future_to_sid):
-                schedules[future_to_sid[future]] = future.result()
+            slot_reserved = [f.result() for f in slot_futures]
+            schedules = {schedule_futures[f]: f.result() for f in as_completed(schedule_futures)}
 
         # Build per-field per-slot status from per-field schedule data
         field_statuses = {}
