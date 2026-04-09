@@ -11,11 +11,26 @@ Usage:
 """
 
 import urllib.request
+import urllib.parse
 import json
 import gzip
 import math
+import os
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _load_env():
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
+GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY")
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -106,15 +121,34 @@ def geom_centroid(geometry, tx, ty, zoom):
     return None
 
 
-def transit_minutes_estimate(origin, dest):
-    """Estimate transit time in minutes using Haversine distance + NYC transit factor.
-    Assumes ~10 mph door-to-door average speed in Brooklyn + 10 min fixed overhead."""
+def _haversine_transit_estimate(origin, dest):
     lat1, lon1 = math.radians(origin[0]), math.radians(origin[1])
     lat2, lon2 = math.radians(dest[0]), math.radians(dest[1])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     miles = EARTH_RADIUS_MI * 2 * math.asin(math.sqrt(a))
     return round(miles * TRANSIT_MIN_PER_MILE + TRANSIT_OVERHEAD_MIN)
+
+
+def transit_minutes_estimate(origin, dest):
+    """Transit time in minutes from origin to dest (lat, lng).
+    Uses Google Maps Distance Matrix API if key is available, else Haversine estimate."""
+    if GOOGLE_MAPS_KEY:
+        try:
+            params = urllib.parse.urlencode({
+                "origins": f"{origin[0]},{origin[1]}",
+                "destinations": f"{dest[0]},{dest[1]}",
+                "mode": "transit",
+                "key": GOOGLE_MAPS_KEY,
+            })
+            url = f"https://maps.googleapis.com/maps/api/distancematrix/json?{params}"
+            data = json.loads(urllib.request.urlopen(url, timeout=10).read())
+            element = data["rows"][0]["elements"][0]
+            if element["status"] == "OK":
+                return round(element["duration"]["value"] / 60)
+        except Exception:
+            pass
+    return _haversine_transit_estimate(origin, dest)
 
 
 def latlng_to_tile(lat, lng, zoom):
