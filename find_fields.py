@@ -24,10 +24,15 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Commute origin: Brooklyn Tech High School, Fort Greene
+ORIGIN = (40.6916, -73.9762)
+
 # Practice schedule: (weekday number per Python's isoweekday(), start_hour, start_min, end_hour, end_min)
 # Monday=1, Tuesday=2, ... Sunday=7
 PRACTICE_SLOTS = [
+    (1, 16, 30, 18, 30),  # Monday 4:30-6:30 PM
     (2, 16, 30, 18, 30),  # Tuesday 4:30-6:30 PM
+    (3, 16, 30, 18, 30),  # Wednesday 4:30-6:30 PM
     (4, 16, 30, 18, 30),  # Thursday 4:30-6:30 PM
     (6, 14, 0, 16, 30),   # Saturday 2:00-4:30 PM
 ]
@@ -36,9 +41,20 @@ DAY_NAMES = {1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", 7: "Sun
 
 # Fields to exclude (known unplayable conditions, etc.)
 EXCLUDED_FIELDS = {
-    "B068-SOCCER-1",   # Parade Ground Soccer-04 — unplayable
-    "B073-ZN28-SOCCER-4A",  # Parade Ground Soccer-04A — unplayable
-    "B073-ZN28-SOCCER-4B",  # Parade Ground Soccer-04B — unplayable
+    "B068-SOCCER-1",         # Parade Ground Soccer-04 — unplayable
+    "B073-ZN28-SOCCER-4A",   # Parade Ground Soccer-04A — unplayable
+    "B073-ZN28-SOCCER-4B",   # Parade Ground Soccer-04B — unplayable
+    "B126-ZN06-SOCCER-1",    # Red Hook Soccer-01 — under construction
+    "B126-ZN07-SOCCER-1",    # Red Hook Soccer-06 — under construction
+}
+
+# Parks to exclude by name substring (case-insensitive)
+EXCLUDED_PARK_NAME_SUBSTRINGS = {"playground", "hamilton metz", "st. john's park", "lincoln terrace"}
+
+# Parks to exclude by park code
+EXCLUDED_PARKS = {
+    "B270",  # Brownsville Playground
+    "B377",  # Floyd Patterson Ballfields — too far
 }
 
 # Sports suitable for ultimate frisbee
@@ -53,6 +69,44 @@ def fetch(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     resp = urllib.request.urlopen(req, timeout=15)
     return resp.read()
+
+
+def tile_pixel_to_latlng(px, py, tx, ty, zoom, extent=4096):
+    """Convert tile-local pixel coordinates to lat/lng."""
+    n = 2 ** zoom
+    lon = (tx + px / extent) / n * 360.0 - 180.0
+    merc_n = math.pi - 2 * math.pi * (ty + py / extent) / n
+    lat = math.degrees(math.atan(math.sinh(merc_n)))
+    return lat, lon
+
+
+def geom_centroid(geometry, tx, ty, zoom):
+    """Extract approximate lat/lng centroid from tile geometry."""
+    geom_type = geometry.get("type", "")
+    coords = geometry.get("coordinates", [])
+    ring = None
+    if geom_type == "Polygon" and coords:
+        ring = coords[0]
+    elif geom_type == "MultiPolygon" and coords and coords[0]:
+        ring = coords[0][0]
+    elif geom_type == "Point":
+        return tile_pixel_to_latlng(coords[0], coords[1], tx, ty, zoom)
+    if ring:
+        cx = sum(c[0] for c in ring) / len(ring)
+        cy = sum(c[1] for c in ring) / len(ring)
+        return tile_pixel_to_latlng(cx, cy, tx, ty, zoom)
+    return None
+
+
+def transit_minutes_estimate(origin, dest):
+    """Estimate transit time in minutes using Haversine distance + NYC transit factor.
+    Assumes ~10 mph door-to-door average speed in Brooklyn + 10 min fixed overhead."""
+    lat1, lon1 = math.radians(origin[0]), math.radians(origin[1])
+    lat2, lon2 = math.radians(dest[0]), math.radians(dest[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    miles = 3958.8 * 2 * math.asin(math.sqrt(a))
+    return round(miles * 6 + 10)  # 6 min/mile in-vehicle + 10 min fixed overhead
 
 
 def latlng_to_tile(lat, lng, zoom):
@@ -92,6 +146,9 @@ def fetch_brooklyn_fields():
                     sid = props.get("system", "")
                     sport = props.get("primary_sport", "")
                     if sid.startswith("B") and sport in SUITABLE_SPORTS and sid not in fields and sid not in EXCLUDED_FIELDS:
+                        centroid = geom_centroid(feat.get("geometry", {}), tx, ty, zoom)
+                        if centroid:
+                            props["_latlng"] = centroid
                         fields[sid] = props
             except Exception:
                 pass
@@ -158,6 +215,50 @@ def check_slot_availability(start_dt, end_dt):
     return reserved_any
 
 
+def fetch_field_schedule(sid, date_str):
+    """Fetch per-field 7-day schedule. Returns availability dict or {} on failure."""
+    url = f"https://www.nycgovparks.org/api/athletic-fields?location={sid}&date={date_str}"
+    try:
+        data = json.loads(fetch(url))
+        return data.get("availability", {})
+    except Exception:
+        return {}
+
+
+def slot_detail(schedule, start_dt, end_dt):
+    """Analyze a slot from per-field schedule data.
+
+    Returns (status, data):
+      ('free', None)
+      ('pending_unnamed', count)          — requests exist, no names visible
+      ('pending_named', {holders})        — named pending permit (not yet issued)
+      ('reserved', {holders})             — confirmed issued permit
+    """
+    t = start_dt
+    confirmed = set()
+    pending_named = set()
+    max_unnamed = 0
+    while t < end_dt:
+        ts = str(int(t.timestamp()))
+        slot = schedule.get(ts, {})
+        if slot and not slot.get("permit_is_for_overlapping_field"):
+            holder = slot.get("permit_holder") or ""
+            if slot.get("is_issued") and holder:
+                confirmed.add(holder)
+            elif not slot.get("is_issued") and holder:
+                pending_named.add(holder)
+            max_unnamed = max(max_unnamed, slot.get("num_pending_permits", 0))
+        t += timedelta(minutes=30)
+
+    if confirmed:
+        return ("reserved", confirmed)
+    if pending_named:
+        return ("pending_named", pending_named)
+    if max_unnamed:
+        return ("pending_unnamed", max_unnamed)
+    return ("free", None)
+
+
 def surface_label(surface):
     labels = {
         "Synthetic - Large/Full": "synth",
@@ -168,6 +269,100 @@ def surface_label(surface):
     return labels.get(surface, surface or "?")
 
 
+def print_table(slots, field_statuses, fields, park_names):
+    """Print a cross-slot availability table.
+    field_statuses: {sid: [('free'|'pending'|'issued', detail), ...]} per slot
+    """
+    headers = [s.strftime("%a %-m/%-d") for s, _ in slots]
+    time_labels = [f"{s.strftime('%-I:%M')}-{e.strftime('%-I:%M %p')}" for s, e in slots]
+
+    rows = []
+    for sid, f in sorted(fields.items(), key=lambda x: (x[1].get("_commute_min", 999), x[1].get("permit_parent", ""), x[1].get("name", ""))):
+        statuses = field_statuses.get(sid, [("reserved", None)] * len(slots))
+        if any(s != "reserved" for s, _ in statuses):
+            park_code = f.get("permit_parent", f.get("gispropnum", "???"))
+            park_name = park_names.get(park_code, park_code)
+            name = f.get("name", "?")
+            surface = surface_label(f.get("surface_type", ""))
+            commute = f.get("_commute_min")
+            commute_str = f"{commute}m" if commute is not None else "?"
+            rows.append((park_name, name, surface, commute_str, statuses))
+
+    if not rows:
+        print("  No fields available within commute limit.")
+        return
+
+    # Collect footnotes for named pending permits
+    footnotes = {}  # ref_char -> org name
+    ref_chars = "abcdefghijklmnopqrstuvwxyz"
+
+    def org_ref(org):
+        for ref, name in footnotes.items():
+            if name == org:
+                return ref
+        ref = ref_chars[len(footnotes)]
+        footnotes[ref] = org
+        return ref
+
+    def cell_raw(status, detail):
+        """Return cell text without centering."""
+        if status == "free":
+            return "Y"
+        elif status == "pending_unnamed":
+            return f"P({detail})"
+        elif status == "pending_named":
+            refs = ",".join(sorted(org_ref(o) for o in detail))
+            return f"P[{refs}]"
+        else:  # reserved
+            return "-"
+
+    park_w = max(len("Park"), max(len(r[0]) for r in rows))
+    field_w = max(len("Field"), max(len(r[1]) for r in rows))
+    surf_w = max(len("Surface"), max(len(r[2]) for r in rows))
+    comm_w = max(len("Transit"), max(len(r[3]) for r in rows))
+
+    # Pre-compute raw cells to determine slot column width
+    raw_rendered = []
+    for park, field, surf, comm, statuses in rows:
+        raw_rendered.append([cell_raw(s, d) for s, d in statuses])
+    slot_w = max(
+        max(len(h) for h in headers),
+        max(len(c) for row in raw_rendered for c in row) if raw_rendered else 0,
+    )
+    # Re-render with correct slot_w (footnote refs are stable across two passes)
+    footnotes.clear()
+    rendered = []
+    for park, field, surf, comm, statuses in rows:
+        rendered.append([cell_raw(s, d) for s, d in statuses])
+
+    def row_str(park, field, surf, comm, cells):
+        return f"  {park:<{park_w}}  {field:<{field_w}}  {surf:<{surf_w}}  {comm:>{comm_w}}  " + "  ".join(c.center(slot_w) for c in cells)
+
+    sep = ("  " + "-" * park_w + "  " + "-" * field_w + "  " + "-" * surf_w + "  " +
+           "-" * comm_w + "  " + "  ".join("-" * slot_w for _ in slots))
+
+    print("  " + " " * park_w + "  " + " " * field_w + "  " + " " * surf_w + "  " + " " * comm_w + "  " + "  ".join(t.center(slot_w) for t in time_labels))
+    print(f"  {'Park':<{park_w}}  {'Field':<{field_w}}  {'Surface':<{surf_w}}  {'Transit':>{comm_w}}  " + "  ".join(h.center(slot_w) for h in headers))
+    print(sep)
+
+    cur_park = None
+    for (park, field, surf, comm, statuses), cells in zip(rows, rendered):
+        if park != cur_park:
+            if cur_park is not None:
+                print()
+            cur_park = park
+        print(row_str(park, field, surf, comm, cells))
+
+    print()
+    print("  Y=free  P(N)=N unnamed pending  P[x]=named pending  -[x]=reserved")
+    print("  Transit = estimated door-to-door transit time from Brooklyn Tech")
+    if footnotes:
+        print()
+        print("  Orgs:")
+        for ref, name in sorted(footnotes.items()):
+            print(f"    [{ref}] {name}")
+
+
 def main():
     import argparse
 
@@ -175,6 +370,8 @@ def main():
     parser.add_argument("--weeks", type=int, default=2, help="Number of weeks to check (default: 2)")
     parser.add_argument("--date", type=str, help="Start date YYYY-MM-DD (default: today)")
     parser.add_argument("--all-surfaces", action="store_true", help="Include asphalt MPPA fields")
+    parser.add_argument("--table", action="store_true", help="Output as a cross-slot availability table")
+    parser.add_argument("--max-commute", type=int, default=35, help="Max driving minutes from Brooklyn Tech (default: 35)")
     args = parser.parse_args()
 
     start = datetime.strptime(args.date, "%Y-%m-%d") if args.date else datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -190,12 +387,72 @@ def main():
             if f.get("surface_type", "") in PREFERRED_SURFACES
         }
 
-    print(f"Tracking {len(fields)} fields (soccer/football/multipurpose/cricket/rugby)")
+    # Filter out excluded parks (by code and by name substring)
+    def park_excluded(f):
+        code = f.get("permit_parent", f.get("gispropnum", ""))
+        if code in EXCLUDED_PARKS:
+            return True
+        name = park_names.get(code, "")
+        return any(sub in name.lower() for sub in EXCLUDED_PARK_NAME_SUBSTRINGS)
+
+    fields = {sid: f for sid, f in fields.items() if not park_excluded(f)}
+
+    # Compute driving times in parallel and filter by max commute
+    print(f"Computing commute times from Brooklyn Tech (max {args.max_commute} min drive)...")
+    for sid, f in fields.items():
+        if "_latlng" in f:
+            f["_commute_min"] = transit_minutes_estimate(ORIGIN, f["_latlng"])
+
+    fields = {
+        sid: f for sid, f in fields.items()
+        if f.get("_commute_min", 999) <= args.max_commute
+    }
+
+    print(f"Tracking {len(fields)} fields within {args.max_commute} min drive of Brooklyn Tech")
     print()
 
     practice_dates = get_practice_dates(start, args.weeks)
     if not practice_dates:
         print("No upcoming practice slots found.")
+        return
+
+    if args.table:
+        # Check global availability per slot
+        slot_reserved = []
+        for slot_start, slot_end in practice_dates:
+            date_str = slot_start.strftime("%a %b %d")
+            time_str = f"{slot_start.strftime('%-I:%M')}-{slot_end.strftime('%-I:%M %p')}"
+            print(f"Checking {date_str} {time_str}...")
+            slot_reserved.append(check_slot_availability(slot_start, slot_end))
+
+        # Fetch per-field schedules in parallel to detect pending requests
+        print("Fetching per-field schedules for pending status...")
+        anchor_date = practice_dates[0][0].strftime("%Y-%m-%d")
+        schedules = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_sid = {
+                executor.submit(fetch_field_schedule, sid, anchor_date): sid
+                for sid in fields
+            }
+            for future in as_completed(future_to_sid):
+                schedules[future_to_sid[future]] = future.result()
+
+        # Build per-field per-slot status from per-field schedule data
+        field_statuses = {}
+        for sid in fields:
+            schedule = schedules.get(sid, {})
+            statuses = []
+            for i, (slot_start, slot_end) in enumerate(practice_dates):
+                if schedule:
+                    statuses.append(slot_detail(schedule, slot_start, slot_end))
+                elif sid in slot_reserved[i]:
+                    statuses.append(("reserved", set()))
+                else:
+                    statuses.append(("free", None))
+            field_statuses[sid] = statuses
+
+        print()
+        print_table(practice_dates, field_statuses, fields, park_names)
         return
 
     for slot_start, slot_end in practice_dates:
