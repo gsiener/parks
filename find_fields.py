@@ -53,9 +53,15 @@ EXCLUDED_FIELDS = {
 # Parks to exclude by name substring (case-insensitive)
 EXCLUDED_PARK_NAME_SUBSTRINGS = {"playground", "hamilton metz", "st. john's park", "lincoln terrace"}
 
+# Park name overrides (park code -> display name)
+PARK_NAME_OVERRIDES = {
+    "B073": "Parade Ground",  # Parks system calls this "Prospect Park" but it's the same complex
+}
+
 # Parks to exclude by park code
 EXCLUDED_PARKS = {
     "B270",  # Brownsville Playground
+    "B372",  # Friends Field — too far
     "B377",  # Floyd Patterson Ballfields — too far
 }
 
@@ -261,6 +267,10 @@ def slot_detail(schedule, start_dt, end_dt):
     return ("free", None)
 
 
+def park_display_name(park_code, park_names):
+    return PARK_NAME_OVERRIDES.get(park_code) or park_names.get(park_code, park_code)
+
+
 def surface_label(surface):
     labels = {
         "Synthetic - Large/Full": "synth",
@@ -283,7 +293,7 @@ def print_table(slots, field_statuses, fields, park_names):
         statuses = field_statuses.get(sid, [("reserved", None)] * len(slots))
         if any(s != "reserved" for s, _ in statuses):
             park_code = f.get("permit_parent", f.get("gispropnum", "???"))
-            park_name = park_names.get(park_code, park_code)
+            park_name = park_display_name(park_code, park_names)
             name = f.get("name", "?")
             surface = surface_label(f.get("surface_type", ""))
             commute = f.get("_commute_min")
@@ -477,7 +487,7 @@ def main():
         print()
 
         for park_code, park_fields in sorted_parks:
-            park_name = park_names.get(park_code, park_code)
+            park_name = park_display_name(park_code, park_names)
             field_strs = []
             for f in sorted(park_fields, key=lambda x: x.get("system", "")):
                 name = f.get("name", "?")
