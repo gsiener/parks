@@ -137,9 +137,27 @@ def _haversine_transit_estimate(origin, dest):
     return round(miles * TRANSIT_MIN_PER_MILE + TRANSIT_OVERHEAD_MIN)
 
 
-def transit_minutes_estimate(origin, dest):
+_COMMUTE_CACHE_PATH = os.path.join(os.path.dirname(__file__), ".commute_cache.json")
+
+def _load_commute_cache():
+    try:
+        with open(_COMMUTE_CACHE_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_commute_cache(cache):
+    with open(_COMMUTE_CACHE_PATH, "w") as f:
+        json.dump(cache, f)
+
+
+def transit_minutes_estimate(origin, dest, cache=None):
     """Transit time in minutes from origin to dest (lat, lng).
-    Uses Google Maps Distance Matrix API if key is available, else Haversine estimate."""
+    Uses Google Maps Distance Matrix API if key is available, else Haversine estimate.
+    Pass cache dict to read/write cached results."""
+    key = f"{dest[0]:.5f},{dest[1]:.5f}"
+    if cache is not None and key in cache:
+        return cache[key]
     if GOOGLE_MAPS_KEY:
         try:
             params = urllib.parse.urlencode({
@@ -152,10 +170,16 @@ def transit_minutes_estimate(origin, dest):
             data = json.loads(urllib.request.urlopen(url, timeout=10).read())
             element = data["rows"][0]["elements"][0]
             if element["status"] == "OK":
-                return round(element["duration"]["value"] / 60)
+                minutes = round(element["duration"]["value"] / 60)
+                if cache is not None:
+                    cache[key] = minutes
+                return minutes
         except Exception:
             pass
-    return _haversine_transit_estimate(origin, dest)
+    minutes = _haversine_transit_estimate(origin, dest)
+    if cache is not None:
+        cache[key] = minutes
+    return minutes
 
 
 def latlng_to_tile(lat, lng, zoom):
@@ -472,11 +496,13 @@ def main():
 
     fields = {sid: f for sid, f in fields.items() if not park_excluded(f)}
 
-    # Compute driving times in parallel and filter by max commute
+    # Compute driving times, using disk cache to avoid redundant API calls
     print(f"Computing commute times from Brooklyn Tech (max {args.max_commute} min drive)...")
+    commute_cache = _load_commute_cache()
     for sid, f in fields.items():
         if "_latlng" in f:
-            f["_commute_min"] = transit_minutes_estimate(ORIGIN, f["_latlng"])
+            f["_commute_min"] = transit_minutes_estimate(ORIGIN, f["_latlng"], cache=commute_cache)
+    _save_commute_cache(commute_cache)
 
     fields = {
         sid: f for sid, f in fields.items()
