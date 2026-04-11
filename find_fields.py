@@ -10,6 +10,7 @@ Usage:
     python3 find_fields.py --date 2026-04-07  # specific week starting date
 """
 
+import re
 import urllib.request
 import urllib.parse
 import json
@@ -18,6 +19,9 @@ import math
 import os
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BOROUGH_PREFIXES = ("B", "M")
+_TRAILING_NUM_RE = re.compile(r"(\d+)\D*$")
 
 def _load_env():
     env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -179,34 +183,40 @@ def fetch_brooklyn_fields():
         min_x, min_y = min(min_x, x), min(min_y, y)
         max_x, max_y = max(max_x, x), max(max_y, y)
 
+    tiles = [(tx, ty) for tx in range(min_x, max_x + 1) for ty in range(min_y, max_y + 1)]
+
+    def fetch_tile(tx, ty):
+        url = f"https://maps.nycgovparks.org/athletic_facility/{zoom}/{tx}/{ty}"
+        try:
+            data = fetch(url)
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            decoded = mapbox_vector_tile.decode(data)
+            layer = decoded.get("athletic_facility_permitable", {})
+            result = {}
+            for feat in layer.get("features", []):
+                props = feat.get("properties", {})
+                sid = props.get("system", "")
+                sport = props.get("primary_sport", "")
+                if sid.startswith(BOROUGH_PREFIXES) and sport in SUITABLE_SPORTS and sid not in EXCLUDED_FIELDS:
+                    centroid = geom_centroid(feat.get("geometry", {}), tx, ty, zoom)
+                    if centroid:
+                        props["_latlng"] = centroid
+                    result[sid] = props
+            return result
+        except Exception:
+            return {}
+
     fields = {}
-    for tx in range(min_x, max_x + 1):
-        for ty in range(min_y, max_y + 1):
-            url = f"https://maps.nycgovparks.org/athletic_facility/{zoom}/{tx}/{ty}"
-            try:
-                data = fetch(url)
-                if data[:2] == b"\x1f\x8b":
-                    data = gzip.decompress(data)
-                decoded = mapbox_vector_tile.decode(data)
-                layer = decoded.get("athletic_facility_permitable", {})
-                for feat in layer.get("features", []):
-                    props = feat.get("properties", {})
-                    sid = props.get("system", "")
-                    sport = props.get("primary_sport", "")
-                    if sid[0] in ("B", "M") and sport in SUITABLE_SPORTS and sid not in fields and sid not in EXCLUDED_FIELDS:
-                        centroid = geom_centroid(feat.get("geometry", {}), tx, ty, zoom)
-                        if centroid:
-                            props["_latlng"] = centroid
-                        fields[sid] = props
-            except Exception:
-                pass
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        for result in executor.map(lambda t: fetch_tile(*t), tiles):
+            for sid, props in result.items():
+                fields.setdefault(sid, props)
     return fields
 
 
 def fetch_park_names():
     """Fetch park code -> park name mapping from the permit page."""
-    import re
-
     html = fetch("https://www.nycgovparks.org/permits/field-and-court/map").decode("utf-8")
     select_match = re.search(
         r"<select[^>]*id=[\"']spreadsheet-select[\"'][^>]*>(.*?)</select>",
@@ -219,7 +229,7 @@ def fetch_park_names():
             r"<option\s+value=[\"']([^\"'>]*)[\"'][^>]*>([^<]*)</option>",
             select_match.group(1),
         ):
-            if code.startswith(("B", "M")):
+            if code.startswith(BOROUGH_PREFIXES):
                 names[code] = name
     return names
 
@@ -289,7 +299,7 @@ def slot_detail(schedule, start_dt, end_dt):
     while t < end_dt:
         ts = str(int(t.timestamp()))
         slot = schedule.get(ts, {})
-        if slot:
+        if slot:  # includes permit_is_for_overlapping_field — overlapping fields block shared physical space
             holder = slot.get("permit_holder") or ""
             if slot.get("is_issued") and holder:
                 confirmed.add(holder)
@@ -328,19 +338,22 @@ def print_table(slots, field_statuses, fields, park_names):
     headers = [s.strftime("%a %-m/%-d") for s, _ in slots]
     time_labels = [f"{s.strftime('%-I:%M')}-{e.strftime('%-I:%M %p')}" for s, e in slots]
 
-    def field_sort_key(item):
-        sid, f = item
+    def field_sort_key(sid, f):
         park_code = f.get("permit_parent", f.get("gispropnum", ""))
-        pname = park_display_name(park_code, park_names)
         fname = f.get("name", "")
-        # Extract trailing number for numeric sort (e.g. "Soccer-07" → 7)
-        import re
-        m = re.search(r"(\d+)\D*$", fname)
+        m = _TRAILING_NUM_RE.search(fname)
         trailing = int(m.group(1)) if m else 0
-        return (pname, trailing, fname)
+        return (park_name_cache[park_code], trailing, fname)
+
+    park_name_cache = {
+        f.get("permit_parent", f.get("gispropnum", "")): park_display_name(
+            f.get("permit_parent", f.get("gispropnum", "")), park_names
+        )
+        for f in fields.values()
+    }
 
     rows = []
-    for sid, f in sorted(fields.items(), key=field_sort_key):
+    for sid, f in sorted(fields.items(), key=lambda x: field_sort_key(*x)):
         statuses = field_statuses.get(sid, [("reserved", None)] * len(slots))
         if any(s != "reserved" for s, _ in statuses):
             park_code = f.get("permit_parent", f.get("gispropnum", "???"))
@@ -479,33 +492,32 @@ def main():
         return
 
     if args.table:
-        anchor_date = practice_dates[0][0].strftime("%Y-%m-%d")
+        # Collect one anchor date per 7-day window needed to cover all practice slots
+        first = practice_dates[0][0]
+        anchor_dates = sorted({
+            (first + timedelta(days=7 * ((slot - first).days // 7))).strftime("%Y-%m-%d")
+            for slot, _ in practice_dates
+        })
+
         print("Checking availability and fetching field schedules...")
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            slot_futures = [
-                executor.submit(check_slot_availability, s, e)
-                for s, e in practice_dates
-            ]
-            schedule_futures = {
-                executor.submit(fetch_field_schedule, sid, anchor_date): sid
-                for sid in fields
-            }
-            slot_reserved = [f.result() for f in slot_futures]
-            schedules = {schedule_futures[f]: f.result() for f in as_completed(schedule_futures)}
+        fetch_jobs = [(sid, anchor) for sid in fields for anchor in anchor_dates]
+        workers = max(len(fetch_jobs), 1)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            raw = {executor.submit(fetch_field_schedule, sid, anchor): (sid, anchor)
+                   for sid, anchor in fetch_jobs}
+            schedules = {}
+            for fut in as_completed(raw):
+                sid, _ = raw[fut]
+                schedules.setdefault(sid, {}).update(fut.result())
 
         # Build per-field per-slot status from per-field schedule data
         field_statuses = {}
         for sid in fields:
             schedule = schedules.get(sid, {})
-            statuses = []
-            for i, (slot_start, slot_end) in enumerate(practice_dates):
-                if schedule:
-                    statuses.append(slot_detail(schedule, slot_start, slot_end))
-                elif sid in slot_reserved[i]:
-                    statuses.append(("reserved", set()))
-                else:
-                    statuses.append(("free", None))
-            field_statuses[sid] = statuses
+            field_statuses[sid] = [
+                slot_detail(schedule, slot_start, slot_end)
+                for slot_start, slot_end in practice_dates
+            ]
 
         print()
         print_table(practice_dates, field_statuses, fields, park_names)
