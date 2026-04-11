@@ -71,6 +71,9 @@ EXCLUDED_PARK_NAME_SUBSTRINGS = {"playground", "hamilton metz", "st. john's park
 # Park name overrides (park code -> display name)
 PARK_NAME_OVERRIDES = {
     "B073": "Parade Ground",  # Parks system calls this "Prospect Park" but it's the same complex
+    "B166C": "Coney Island Boat Basin",
+    "B166D": "McGuire Fields",
+    "B371": "Spring Creek Park",
 }
 
 # Parks to exclude by park code
@@ -160,12 +163,15 @@ def latlng_to_tile(lat, lng, zoom):
 
 
 def fetch_brooklyn_fields():
-    """Fetch all Brooklyn permitable fields from vector tiles."""
+    """Fetch all Brooklyn and Manhattan permitable fields from vector tiles."""
     import mapbox_vector_tile
 
     zoom = 13
-    # Brooklyn bounds
-    corners = [(40.57, -74.04), (40.57, -73.86), (40.74, -74.04), (40.74, -73.86)]
+    # Brooklyn + Manhattan bounds
+    corners = [
+        (40.57, -74.04), (40.57, -73.86),  # Brooklyn
+        (40.70, -74.02), (40.88, -73.91),  # Manhattan
+    ]
     min_x = min_y = float("inf")
     max_x = max_y = 0
     for lat, lng in corners:
@@ -187,7 +193,7 @@ def fetch_brooklyn_fields():
                     props = feat.get("properties", {})
                     sid = props.get("system", "")
                     sport = props.get("primary_sport", "")
-                    if sid.startswith("B") and sport in SUITABLE_SPORTS and sid not in fields and sid not in EXCLUDED_FIELDS:
+                    if sid[0] in ("B", "M") and sport in SUITABLE_SPORTS and sid not in fields and sid not in EXCLUDED_FIELDS:
                         centroid = geom_centroid(feat.get("geometry", {}), tx, ty, zoom)
                         if centroid:
                             props["_latlng"] = centroid
@@ -213,7 +219,7 @@ def fetch_park_names():
             r"<option\s+value=[\"']([^\"'>]*)[\"'][^>]*>([^<]*)</option>",
             select_match.group(1),
         ):
-            if code.startswith("B"):
+            if code.startswith(("B", "M")):
                 names[code] = name
     return names
 
@@ -283,7 +289,7 @@ def slot_detail(schedule, start_dt, end_dt):
     while t < end_dt:
         ts = str(int(t.timestamp()))
         slot = schedule.get(ts, {})
-        if slot and not slot.get("permit_is_for_overlapping_field"):
+        if slot:
             holder = slot.get("permit_holder") or ""
             if slot.get("is_issued") and holder:
                 confirmed.add(holder)
@@ -322,8 +328,19 @@ def print_table(slots, field_statuses, fields, park_names):
     headers = [s.strftime("%a %-m/%-d") for s, _ in slots]
     time_labels = [f"{s.strftime('%-I:%M')}-{e.strftime('%-I:%M %p')}" for s, e in slots]
 
+    def field_sort_key(item):
+        sid, f = item
+        park_code = f.get("permit_parent", f.get("gispropnum", ""))
+        pname = park_display_name(park_code, park_names)
+        fname = f.get("name", "")
+        # Extract trailing number for numeric sort (e.g. "Soccer-07" → 7)
+        import re
+        m = re.search(r"(\d+)\D*$", fname)
+        trailing = int(m.group(1)) if m else 0
+        return (pname, trailing, fname)
+
     rows = []
-    for sid, f in sorted(fields.items(), key=lambda x: (x[1].get("_commute_min", 999), x[1].get("permit_parent", ""), x[1].get("name", ""))):
+    for sid, f in sorted(fields.items(), key=field_sort_key):
         statuses = field_statuses.get(sid, [("reserved", None)] * len(slots))
         if any(s != "reserved" for s, _ in statuses):
             park_code = f.get("permit_parent", f.get("gispropnum", "???"))
