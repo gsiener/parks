@@ -67,6 +67,9 @@ EXCLUDED_FIELDS = {
     "B073-ZN28-SOCCER-4B",   # Parade Ground Soccer-04B — unplayable
     "B126-ZN06-SOCCER-1",    # Red Hook Soccer-01 — under construction
     "B126-ZN07-SOCCER-1",    # Red Hook Soccer-06 — under construction
+    "M144-ZN05-SOCCER-1",    # East River Park Soccer-04 East 6th St — under construction
+    "M144-ZN05-SOCCER-2",    # East River Park Soccer-01A East 6th St — under construction
+    "M144-ZN05-SOCCER-3",    # East River Park Soccer-01B East 6th St — under construction
 }
 
 # Parks to exclude by name substring (case-insensitive)
@@ -138,17 +141,19 @@ def _haversine_transit_estimate(origin, dest):
 
 
 _COMMUTE_CACHE_PATH = os.path.join(os.path.dirname(__file__), ".commute_cache.json")
+_PARKS_CACHE_PATH = os.path.join(os.path.dirname(__file__), ".parks_cache.json")
 
-def _load_commute_cache():
+def _load_json_cache(path):
     try:
-        with open(_COMMUTE_CACHE_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def _save_commute_cache(cache):
-    with open(_COMMUTE_CACHE_PATH, "w") as f:
-        json.dump(cache, f)
+def _save_json_cache(path, cache):
+    with open(path, "w") as f:
+        json.dump(cache, f, separators=(",", ":"))
+
 
 
 def transit_minutes_estimate(origin, dest, cache=None):
@@ -190,8 +195,11 @@ def latlng_to_tile(lat, lng, zoom):
     return x, y
 
 
-def fetch_brooklyn_fields():
+def fetch_brooklyn_fields(cache=None):
     """Fetch all Brooklyn and Manhattan permitable fields from vector tiles."""
+    if cache is not None and "fields" in cache:
+        return cache["fields"]
+
     import mapbox_vector_tile
 
     zoom = 13
@@ -236,11 +244,17 @@ def fetch_brooklyn_fields():
         for result in executor.map(lambda t: fetch_tile(*t), tiles):
             for sid, props in result.items():
                 fields.setdefault(sid, props)
+
+    if cache is not None and fields:
+        cache["fields"] = fields
     return fields
 
 
-def fetch_park_names():
+def fetch_park_names(cache=None):
     """Fetch park code -> park name mapping from the permit page."""
+    if cache is not None and "park_names" in cache:
+        return cache["park_names"]
+
     html = fetch("https://www.nycgovparks.org/permits/field-and-court/map").decode("utf-8")
     select_match = re.search(
         r"<select[^>]*id=[\"']spreadsheet-select[\"'][^>]*>(.*?)</select>",
@@ -255,13 +269,26 @@ def fetch_park_names():
         ):
             if code.startswith(BOROUGH_PREFIXES):
                 names[code] = name
+
+    if cache is not None and names:
+        cache["park_names"] = names
     return names
 
 
-def check_availability_at(dt_str):
+def check_availability_at(dt_str, cache=None):
     """Query global availability API. Returns set of reserved field system IDs."""
+    cache_key = f"avail:{dt_str}"
+    if cache is not None and cache_key in cache:
+        entry = cache[cache_key]
+        return set(entry.get("l", [])), entry.get("dusk", "20:00")
+
     url = f"https://www.nycgovparks.org/api/athletic-fields?datetime={dt_str}"
-    data = json.loads(fetch(url))
+    raw = fetch(url)
+    if not raw:
+        return set(), "20:00"
+    data = json.loads(raw)
+    if cache is not None:
+        cache[cache_key] = data
     return set(data.get("l", [])), data.get("dusk", "20:00")
 
 
@@ -281,7 +308,7 @@ def get_practice_dates(start_date, weeks):
     return sorted(dates)
 
 
-def check_slot_availability(start_dt, end_dt):
+def check_slot_availability(start_dt, end_dt, cache=None):
     """Check availability at 30-min intervals across a practice slot.
     A field is available only if it's free for the ENTIRE slot."""
     reserved_any = set()
@@ -289,7 +316,7 @@ def check_slot_availability(start_dt, end_dt):
     while t < end_dt:
         dt_str = t.strftime("%Y-%m-%d+%H:%M")
         try:
-            reserved, dusk = check_availability_at(dt_str)
+            reserved, dusk = check_availability_at(dt_str, cache=cache)
             reserved_any.update(reserved)
         except Exception as e:
             print(f"  Warning: failed to check {dt_str}: {e}")
@@ -297,12 +324,22 @@ def check_slot_availability(start_dt, end_dt):
     return reserved_any
 
 
-def fetch_field_schedule(sid, date_str):
+def fetch_field_schedule(sid, date_str, cache=None):
     """Fetch per-field 7-day schedule. Returns availability dict or {} on failure."""
+    cache_key = f"sched:{sid}:{date_str}"
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
     url = f"https://www.nycgovparks.org/api/athletic-fields?location={sid}&date={date_str}"
     try:
-        data = json.loads(fetch(url))
-        return data.get("availability", {})
+        raw = fetch(url)
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        result = data.get("availability", {})
+        if cache is not None and result:
+            cache[cache_key] = result
+        return result
     except Exception:
         return {}
 
@@ -471,13 +508,16 @@ def main():
     parser.add_argument("--all-surfaces", action="store_true", help="Include asphalt MPPA fields")
     parser.add_argument("--table", action="store_true", help="Output as a cross-slot availability table")
     parser.add_argument("--max-commute", type=int, default=35, help="Max driving minutes from Brooklyn Tech (default: 35)")
+    parser.add_argument("--no-cache", action="store_true", help="Ignore cached API responses and fetch fresh data")
     args = parser.parse_args()
 
     start = datetime.strptime(args.date, "%Y-%m-%d") if args.date else datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    print("Loading Brooklyn field inventory...")
-    fields = fetch_brooklyn_fields()
-    park_names = fetch_park_names()
+    parks_cache = {} if args.no_cache else _load_json_cache(_PARKS_CACHE_PATH)
+
+    print("Loading field inventory...")
+    fields = fetch_brooklyn_fields(cache=parks_cache)
+    park_names = fetch_park_names(cache=parks_cache)
 
     # Filter out asphalt MPPA unless --all-surfaces
     if not args.all_surfaces:
@@ -498,11 +538,11 @@ def main():
 
     # Compute driving times, using disk cache to avoid redundant API calls
     print(f"Computing commute times from Brooklyn Tech (max {args.max_commute} min drive)...")
-    commute_cache = _load_commute_cache()
+    commute_cache = _load_json_cache(_COMMUTE_CACHE_PATH)
     for sid, f in fields.items():
         if "_latlng" in f:
             f["_commute_min"] = transit_minutes_estimate(ORIGIN, f["_latlng"], cache=commute_cache)
-    _save_commute_cache(commute_cache)
+    _save_json_cache(_COMMUTE_CACHE_PATH, commute_cache)
 
     fields = {
         sid: f for sid, f in fields.items()
@@ -525,16 +565,26 @@ def main():
             for slot, _ in practice_dates
         })
 
-        print("Checking availability and fetching field schedules...")
-        fetch_jobs = [(sid, anchor) for sid in fields for anchor in anchor_dates]
-        workers = max(len(fetch_jobs), 1)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            raw = {executor.submit(fetch_field_schedule, sid, anchor): (sid, anchor)
-                   for sid, anchor in fetch_jobs}
-            schedules = {}
-            for fut in as_completed(raw):
-                sid, _ = raw[fut]
-                schedules.setdefault(sid, {}).update(fut.result())
+        all_jobs = [(sid, anchor) for sid in fields for anchor in anchor_dates]
+        uncached = [(sid, anchor) for sid, anchor in all_jobs
+                    if f"sched:{sid}:{anchor}" not in parks_cache]
+        if uncached:
+            print(f"Fetching field schedules ({len(uncached)} requests, {len(all_jobs) - len(uncached)} cached)...")
+        else:
+            print(f"Loading field schedules ({len(all_jobs)} cached)...")
+
+        schedules = {}
+        for sid, anchor in all_jobs:
+            cached = parks_cache.get(f"sched:{sid}:{anchor}")
+            if cached:
+                schedules.setdefault(sid, {}).update(cached)
+        if uncached:
+            with ThreadPoolExecutor(max_workers=len(uncached)) as executor:
+                futs = {executor.submit(fetch_field_schedule, sid, anchor, parks_cache): (sid, anchor)
+                        for sid, anchor in uncached}
+                for fut in as_completed(futs):
+                    sid, _ = futs[fut]
+                    schedules.setdefault(sid, {}).update(fut.result())
 
         # Build per-field per-slot status from per-field schedule data
         field_statuses = {}
@@ -547,6 +597,7 @@ def main():
 
         print()
         print_table(practice_dates, field_statuses, fields, park_names)
+        _save_json_cache(_PARKS_CACHE_PATH, parks_cache)
         return
 
     for slot_start, slot_end in practice_dates:
@@ -557,7 +608,7 @@ def main():
         print(f"  {date_str}  {time_str}")
         print(f"{'=' * 60}")
 
-        reserved = check_slot_availability(slot_start, slot_end)
+        reserved = check_slot_availability(slot_start, slot_end, cache=parks_cache)
 
         # Find available fields
         available = {}
@@ -590,6 +641,8 @@ def main():
             print()
 
         print()
+
+    _save_json_cache(_PARKS_CACHE_PATH, parks_cache)
 
 
 if __name__ == "__main__":
