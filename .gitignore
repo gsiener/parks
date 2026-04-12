@@ -1,3 +1,4 @@
 .env
 .commute_cache.json
+.parks_cache.json
 __pycache__/
